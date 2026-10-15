@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - engine: mysql
+    queries: db/queries
+    schema: db/schema.sql
+    gen:
+      go:
+        package: store
+        out: internal/store
+        sql_package: database/sql
+        emit_methods_with_db_argument: true
+        omit_unused_structs: true

@@ -1,0 +1,245 @@
+# Go backend for local checks. One image: api, relay, worker, scheduler, migrate, seed.
+# The API listens on every interface inside the container and is published
+# only on the host loopback. MySQL, Redis and Kafka are not published.
+#
+#   docker compose up --build
+#   curl -sS http://127.0.0.1:8081/up
+#   curl -sS -H 'Access-Token: api02xxxxxxxxxxxxxxxxxxxxxxxxxxx' http://127.0.0.1:8081/api/v1/currencies
+#
+# An empty MySQL volume is created by migrate and filled by seed.
+# The running go-mysql volume keeps its data.
+
+name: finance-go
+
+services:
+  api:
+    build: .
+    image: finance-go
+    command: ["api"]
+    hostname: go-api
+    ports:
+      - "127.0.0.1:8081:8080"
+    environment: &go-env
+      APP_ENV: local
+      APP_NAME: demo.local
+      APP_TIMEZONE: Europe/Moscow
+      HTTP_ADDR: 0.0.0.0:8080
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: dev-app
+      DB_USERNAME: root
+      DB_PASSWORD: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_CACHE_DB: "1"
+      PRICES_REDIS_HOST: prices
+      PRICES_REDIS_PORT: "6379"
+      PRICES_REDIS_DB: "0"
+      AUDIT_REDIS_DB: "2"
+      ORDER_POOLING_MAX_WAIT_TIME: "30000"
+      ORDER_POOLING_POLL_INTERVAL: "100"
+      ORDER_POOLING_MAX_WAITERS: "64"
+      FEATURE_CASCADE: "true"
+      CASCADE_PAYMENT_DETAIL_ID: "6"
+      CALLBACK_INSECURE_SKIP_VERIFY: "true"
+      KAFKA_BROKERS: kafka:9092
+      API_BOT_TOKEN: local-bot-token
+      API_DEPOSIT_TOKEN: local-deposit-token
+      API_WITHDRAW_TOKEN: local-withdraw-token
+      IMPERSONATION_KEY: local-impersonation-key
+      SCHEDULE_ADDR: 0.0.0.0:8090
+      SCHEDULE_TOKEN: local-schedule-token
+      RECEIPTS_DIR: /tmp/receipts
+    depends_on:
+      mysql:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      prices:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/up"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  relay:
+    image: finance-go
+    command: ["relay"]
+    hostname: go-relay
+    environment: *go-env
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: finance-go
+    command: ["worker"]
+    hostname: go-worker
+    environment: *go-env
+    depends_on:
+      api:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    image: finance-go
+    command: ["scheduler"]
+    hostname: go-scheduler
+    environment: *go-env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      prices:
+        condition: service_healthy
+    restart: unless-stopped
+
+  migrate:
+    image: finance-go
+    command: ["migrate"]
+    hostname: go-migrate
+    environment: *go-env
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    image: finance-go
+    command: ["seed"]
+    hostname: go-seed
+    environment: *go-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  mysql:
+    image: mysql:8.0
+    hostname: mysql
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: dev-app
+    volumes:
+      - go-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  prices:
+    image: redis:7-alpine
+    hostname: prices
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - go-prices:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 25s
+    restart: unless-stopped
+
+  dev-http:
+    image: nginx:1.27-alpine
+    hostname: dev-http
+    container_name: dev-http
+    ports:
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./deploy/nginx/dev-http.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - default
+      - app_network
+    restart: unless-stopped
+
+  tester:
+    build:
+      context: ../tester
+    image: finance-go-tester
+    hostname: go-tester
+    ports:
+      - "127.0.0.1:3010:3010"
+    environment:
+      API_BASE_URL: http://api:8080
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: ""
+      DB_NAME: dev-app
+      ADMIN_EMAIL: admin-1@demo.local
+      ADMIN_PASSWORD: password
+      BOT_TOKEN: local-bot-token
+      DEPOSIT_TOKEN: local-deposit-token
+      WITHDRAW_TOKEN: local-withdraw-token
+      SCHEDULER_URL: http://scheduler:8090
+      SCHEDULE_TOKEN: local-schedule-token
+      REPORT_DIR: /app/reports
+    volumes:
+      - ../tester/reports:/app/reports
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  go-mysql:
+  go-prices:
+
+networks:
+  app_network:
+    name: app_network
+    external: true
