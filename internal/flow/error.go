@@ -39,6 +39,11 @@ func invalid(fields map[string][]string) *Error {
 	return &Error{Status: 422, Message: validationMessage(fields), Fields: fields}
 }
 
+// Invalid is a 422 whose message names the first problem and how many remain.
+func Invalid(fields map[string][]string) *Error {
+	return invalid(fields)
+}
+
 func validationMessage(fields map[string][]string) string {
 	keys := make([]string, 0, len(fields))
 	for key := range fields {

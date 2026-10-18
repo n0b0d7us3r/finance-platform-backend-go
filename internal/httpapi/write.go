@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"finance-platform/go/internal/flow"
+	"finance-platform/go/internal/impersonate"
 	"finance-platform/go/internal/read"
 	"finance-platform/go/internal/requisite"
 	"finance-platform/go/internal/store"
@@ -137,35 +138,53 @@ func (h *handler) loginLeader(w http.ResponseWriter, r *http.Request) {
 	h.login(w, r, "Team Leader", "leader")
 }
 
-type userBody struct {
-	Name     string      `json:"name"`
-	Email    string      `json:"email"`
-	Password string      `json:"password"`
-	Role     string      `json:"role"`
-	Reserve  json.Number `json:"target_reserve_amount"`
-	Payouts  bool        `json:"payouts_enabled"`
-}
-
 func (h *handler) createUser(w http.ResponseWriter, r *http.Request) {
 	actor, ok := h.actor(w, r, "Admin")
 	if !ok {
 		return
 	}
-	var body userBody
-	if err := decode(r, &body); err != nil {
+	var raw map[string]json.RawMessage
+	if err := decode(r, &raw); err != nil {
 		writeFail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	reserve := 0
-	if body.Reserve != "" {
-		value, err := body.Reserve.Int64()
-		if err != nil {
-			writeFail(w, http.StatusUnprocessableEntity, "target_reserve_amount")
-			return
+	edit, fields := userEdit(raw)
+	if !edit.RoleSet {
+		if roleName, present := optionalString(raw["role"]); present && strings.TrimSpace(roleName) != "" {
+			var roleID int64
+			err := h.deps.DB.SQL.QueryRowContext(r.Context(), `SELECT id FROM roles WHERE name = ?`, strings.TrimSpace(roleName)).Scan(&roleID)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeFail(w, http.StatusUnprocessableEntity, "Роль не найдена.")
+				return
+			}
+			if err != nil {
+				writeFail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			edit.RoleID, edit.RoleSet = roleID, true
 		}
-		reserve = int(value)
 	}
-	created, err := h.flow().CreateUser(r.Context(), actor, body.Name, body.Email, body.Password, body.Role, reserve, body.Payouts)
+	if strings.TrimSpace(edit.Name) == "" {
+		fields["name"] = []string{"The name field is required."}
+	}
+	if strings.TrimSpace(edit.Email) == "" {
+		fields["email"] = []string{"The email field is required."}
+	}
+	if _, mismatch := fields["password"]; !mismatch && (!edit.PasswordSet || strings.TrimSpace(edit.Password) == "") {
+		fields["password"] = []string{"The password field is required."}
+	}
+	if !edit.RoleSet {
+		if _, present := raw["role"]; present {
+			fields["role"] = []string{"The role field is required."}
+		} else {
+			fields["role_id"] = []string{"The role id field is required."}
+		}
+	}
+	if len(fields) > 0 {
+		h.writeFlow(w, flow.Invalid(fields))
+		return
+	}
+	created, err := h.flow().CreateCabinetUser(r.Context(), actor, edit)
 	if h.writeFlow(w, err) {
 		return
 	}
@@ -301,6 +320,7 @@ func jsonScalar(raw json.RawMessage) (string, bool) {
 type depositBody struct {
 	Amount      json.Number `json:"amount"`
 	BalanceType string      `json:"balance_type"`
+	TxHash      string      `json:"tx_hash"`
 }
 
 func (h *handler) deposit(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +337,27 @@ func (h *handler) deposit(w http.ResponseWriter, r *http.Request) {
 		writeFail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if h.writeFlow(w, h.flow().Deposit(r.Context(), actor, id, body.Amount.String(), body.BalanceType)) {
+	if h.writeFlow(w, h.flow().Deposit(r.Context(), actor, id, body.Amount.String(), body.BalanceType, body.TxHash)) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Средства зачислены"})
+}
+
+func (h *handler) viewedDeposit(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.user(w, r); !ok {
+		return
+	}
+	active, viewing := impersonate.FromContext(r.Context())
+	if !viewing {
+		writeMessage(w, http.StatusForbidden, "Пополнение доступно администратору в режиме просмотра.")
+		return
+	}
+	var body depositBody
+	if err := decode(r, &body); err != nil {
+		writeFail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.writeFlow(w, h.flow().Deposit(r.Context(), active.ActorID, active.TargetID, body.Amount.String(), body.BalanceType, body.TxHash)) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Средства зачислены"})

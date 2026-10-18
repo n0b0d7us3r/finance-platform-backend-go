@@ -30,6 +30,10 @@ func (h *handler) cabinetRoutes(router chi.Router) {
 	router.Get("/api/frontend/admin/users/{id}", h.adminUser)
 	router.Get("/api/frontend/admin/users/{id}/notes", h.adminNotes)
 	router.Get("/api/frontend/admin/users/{id}/wallet", h.adminWallet)
+	router.Get("/api/frontend/merchant/wallet/balances", h.walletBalances("Merchant"))
+	router.Get("/api/frontend/trader/wallet/balances", h.walletBalances("Trader"))
+	router.Get("/api/frontend/support/wallet/balances", h.walletBalances("Support", "Merchant Support"))
+	router.Get("/api/frontend/leader/wallet/balances", h.walletBalances("Team Leader"))
 	router.Get("/api/frontend/admin/orders", h.adminOrders)
 	router.Get("/api/frontend/admin/disputes", h.adminDisputes)
 	router.Get("/api/frontend/admin/payouts", h.adminPayouts)
@@ -299,8 +303,19 @@ func (h *handler) adminWallet(w http.ResponseWriter, r *http.Request) {
 	tx, err := reader.Transactions(r.Context(), page, id)
 	h.showCabinet(w, map[string]any{
 		"walletStats":  reader.WalletStats(r.Context(), id, "trust_balance"),
+		"balances":     reader.WalletBalances(r.Context(), id),
 		"transactions": tx,
 	}, err)
+}
+
+func (h *handler) walletBalances(roles ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		reader, id, ok := h.openCabinet(w, r, roles...)
+		if !ok {
+			return
+		}
+		h.showCabinet(w, map[string]any{"balances": reader.WalletBalances(r.Context(), id)}, nil)
+	}
 }
 
 func (h *handler) adminOrders(w http.ResponseWriter, r *http.Request) {

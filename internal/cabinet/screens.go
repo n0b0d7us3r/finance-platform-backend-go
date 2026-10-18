@@ -729,6 +729,68 @@ func (r *Reader) WalletStats(ctx context.Context, userID int64, column string) m
 	return map[string]any{"balance": beauty(balance, "usdt")}
 }
 
+// WalletBalances is the role balance shown in finance management.
+// Trader balance is the free trust plus the insurance deposit.
+func (r *Reader) WalletBalances(ctx context.Context, userID int64) map[string]any {
+	var trust, reserve, merchant, team string
+	var target int
+	err := r.DB.QueryRowContext(ctx, `
+		SELECT COALESCE(trust_balance, '0'), COALESCE(reserve_balance, '0'),
+		       COALESCE(merchant_balance, '0'), COALESCE(teamleader_balance, '0'),
+		       COALESCE(target_reserve_amount, 0)
+		FROM wallets WHERE user_id = ?`, userID).Scan(&trust, &reserve, &merchant, &team, &target)
+	if err != nil {
+		trust, reserve, merchant, team = "0", "0", "0", "0"
+	}
+	goal, err := money.FromPrecision(strconv.Itoa(target), "usdt")
+	targetText := "0"
+	open := false
+	if err == nil {
+		if text, precErr := goal.Precision(); precErr == nil {
+			targetText = text
+		}
+		held, heldErr := money.FromUnits(reserve, "usdt")
+		if heldErr == nil {
+			open, _ = held.LessThan(goal)
+		}
+	}
+	return map[string]any{
+		"trust":          beauty(trust, "usdt"),
+		"reserve":        beauty(reserve, "usdt"),
+		"reserve_target": targetText,
+		"reserve_open":   open,
+		"trader":         addBeauty(trust, reserve),
+		"merchant":       beauty(merchant, "usdt"),
+		"teamleader":     beauty(team, "usdt"),
+	}
+}
+
+func addBeauty(left, right string) string {
+	if left == "" {
+		left = "0"
+	}
+	if right == "" {
+		right = "0"
+	}
+	a, err := money.FromUnits(left, "usdt")
+	if err != nil {
+		return "0"
+	}
+	b, err := money.FromUnits(right, "usdt")
+	if err != nil {
+		return "0"
+	}
+	sum, err := a.AddMoney(b)
+	if err != nil {
+		return "0"
+	}
+	text, err := sum.Precision()
+	if err != nil {
+		return "0"
+	}
+	return text
+}
+
 // Referrals lists traders and merchants attached to a team leader.
 func (r *Reader) Referrals(ctx context.Context, leaderID int64, page Page) (map[string]any, error) {
 	query := `
@@ -966,6 +1028,7 @@ func (r *Reader) UserCard(ctx context.Context, id int64) (map[string]any, error)
 	var (
 		name, email, referral           string
 		category, roleID                sql.NullInt64
+		reserve                         int
 		banned                          sql.NullTime
 		payouts, stop, has2FA           int
 		traderRate, roleName, promoCode sql.NullString
@@ -973,7 +1036,8 @@ func (r *Reader) UserCard(ctx context.Context, id int64) (map[string]any, error)
 	err := r.DB.QueryRowContext(ctx, `
 		SELECT u.name, u.email, u.trader_category_id, u.banned_at, u.payouts_enabled, u.stop_traffic,
 		       CAST(u.referral_commission_percentage AS CHAR), CAST(u.trader_commission_rate AS CHAR),
-		       u.google2fa_secret IS NOT NULL, r.id, r.name, p.code
+		       u.google2fa_secret IS NOT NULL, r.id, r.name, p.code,
+		       COALESCE((SELECT w.target_reserve_amount FROM wallets w WHERE w.user_id = u.id ORDER BY w.id LIMIT 1), 1000)
 		FROM users u
 		LEFT JOIN user_roles ur ON ur.user_id = u.id
 		LEFT JOIN roles r ON r.id = ur.role_id
@@ -981,7 +1045,7 @@ func (r *Reader) UserCard(ctx context.Context, id int64) (map[string]any, error)
 		WHERE u.id = ?
 		ORDER BY r.id
 		LIMIT 1`, id).Scan(
-		&name, &email, &category, &banned, &payouts, &stop, &referral, &traderRate, &has2FA, &roleID, &roleName, &promoCode)
+		&name, &email, &category, &banned, &payouts, &stop, &referral, &traderRate, &has2FA, &roleID, &roleName, &promoCode, &reserve)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,6 +1072,7 @@ func (r *Reader) UserCard(ctx context.Context, id int64) (map[string]any, error)
 	return map[string]any{
 		"id": id, "name": name, "email": email,
 		"role": role, "promo_code": promo, "trader_category_id": categoryID,
+		"target_reserve_amount": reserve,
 		"merchant_category_ids": merchantCategories,
 		"banned_at":             r.date(banned), "payouts_enabled": payouts == 1, "stop_traffic": stop == 1,
 		"referral_commission_percentage": referral, "trader_commission_rate": rate,

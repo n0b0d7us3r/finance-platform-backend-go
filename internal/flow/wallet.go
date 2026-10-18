@@ -269,6 +269,29 @@ func moveTeamleader(ctx context.Context, tx *sql.Tx, userID int64, units string,
 	return postEntry(ctx, tx, row.ID, zero(units), direction, kind, "teamleader", now)
 }
 
+func creditTeamleader(ctx context.Context, tx *sql.Tx, userID int64, units string, now interface{}) error {
+	row, err := lockWallet(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
+	current, err := money.FromUnits(zero(row.Teamleader), "usdt")
+	if err != nil {
+		return err
+	}
+	delta, err := money.FromUnits(zero(units), "usdt")
+	if err != nil {
+		return err
+	}
+	next, err := current.AddMoney(delta)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE wallets SET teamleader_balance = ?, updated_at = ? WHERE id = ?`, next.Units(), now, row.ID); err != nil {
+		return err
+	}
+	return postEntry(ctx, tx, row.ID, zero(units), "in", "deposit_by_admin", "teamleader", now)
+}
+
 func postEntry(ctx context.Context, tx *sql.Tx, walletID int64, units, direction, kind, balance string, now interface{}) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO transactions (amount, currency, direction, type, balance_type, wallet_id, created_at, updated_at)

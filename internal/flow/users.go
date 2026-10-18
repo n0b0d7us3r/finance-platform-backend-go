@@ -64,13 +64,22 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 	}
 	name = strings.TrimSpace(name)
 	email = strings.TrimSpace(email)
-	if name == "" || email == "" || password == "" || role == "" {
-		return NewUser{}, invalid(map[string][]string{
-			"email":    {"The email field is required."},
-			"name":     {"The name field is required."},
-			"password": {"The password field is required."},
-			"role":     {"The role field is required."},
-		})
+	role = strings.TrimSpace(role)
+	fields := map[string][]string{}
+	if name == "" {
+		fields["name"] = []string{"The name field is required."}
+	}
+	if email == "" {
+		fields["email"] = []string{"The email field is required."}
+	}
+	if password == "" {
+		fields["password"] = []string{"The password field is required."}
+	}
+	if role == "" {
+		fields["role"] = []string{"The role field is required."}
+	}
+	if len(fields) > 0 {
+		return NewUser{}, invalid(fields)
 	}
 	var roleID int64
 	err := s.DB.QueryRowContext(ctx, `SELECT id FROM roles WHERE name = ?`, role).Scan(&roleID)
@@ -80,7 +89,102 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 	if err != nil {
 		return NewUser{}, err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	enabled := payouts
+	return s.CreateCabinetUser(ctx, actor, UserEdit{
+		Name: name, NameSet: true,
+		Email: email, EmailSet: true,
+		Password: password, PasswordSet: true,
+		RoleID: roleID, RoleSet: true,
+		Reserve: reserve, ReserveSet: true,
+		Payouts: &enabled,
+	})
+}
+
+// CreateCabinetUser inserts a user from the admin form, including the role-specific fields.
+func (s *Service) CreateCabinetUser(ctx context.Context, actor int64, edit UserEdit) (NewUser, error) {
+	if err := s.requireRole(ctx, actor, "Admin"); err != nil {
+		return NewUser{}, err
+	}
+	edit.Name = strings.TrimSpace(edit.Name)
+	edit.Email = strings.TrimSpace(edit.Email)
+	fields := map[string][]string{}
+	if edit.Name == "" {
+		fields["name"] = []string{"The name field is required."}
+	}
+	if edit.Email == "" {
+		fields["email"] = []string{"The email field is required."}
+	}
+	if !edit.PasswordSet || edit.Password == "" {
+		fields["password"] = []string{"The password field is required."}
+	}
+	if !edit.RoleSet || edit.RoleID <= 0 {
+		fields["role_id"] = []string{"The role id field is required."}
+	}
+	var roleName string
+	if edit.RoleSet && edit.RoleID > 0 {
+		err := s.DB.QueryRowContext(ctx, `SELECT name FROM roles WHERE id = ?`, edit.RoleID).Scan(&roleName)
+		if err == sql.ErrNoRows {
+			fields["role_id"] = []string{"The selected role id is invalid."}
+		} else if err != nil {
+			return NewUser{}, err
+		} else {
+			applyRolePolicy(&edit, roleName)
+		}
+	}
+	if edit.CategorySet && !edit.CategoryClear {
+		var categoryID int64
+		err := s.DB.QueryRowContext(ctx, `SELECT id FROM trader_categories WHERE id = ?`, edit.CategoryID).Scan(&categoryID)
+		if err == sql.ErrNoRows {
+			fields["trader_category_id"] = []string{"The selected trader category id is invalid."}
+		} else if err != nil {
+			return NewUser{}, err
+		}
+	}
+	var promoID int64
+	if edit.PromoSet && edit.Promo != "" {
+		err := s.DB.QueryRowContext(ctx, `SELECT id FROM promo_codes WHERE code = ?`, edit.Promo).Scan(&promoID)
+		if err == sql.ErrNoRows {
+			fields["promo_code"] = []string{"The selected promo code is invalid."}
+		} else if err != nil {
+			return NewUser{}, err
+		}
+	}
+	if edit.ReferralSet {
+		text, ok := percentText(edit.Referral)
+		if !ok {
+			fields["referral_commission_percentage"] = []string{"The referral commission percentage field must be a number."}
+		} else {
+			edit.Referral = text
+		}
+	}
+	if edit.MerchantCategoriesSet {
+		for _, categoryID := range edit.MerchantCategories {
+			var found int64
+			err := s.DB.QueryRowContext(ctx, `SELECT id FROM categories WHERE id = ?`, categoryID).Scan(&found)
+			if err == sql.ErrNoRows {
+				fields["category_ids"] = []string{"The selected category id is invalid."}
+				break
+			}
+			if err != nil {
+				return NewUser{}, err
+			}
+		}
+	}
+	if edit.TraderRateSet && !edit.TraderRateClear {
+		text, ok := percentText(edit.TraderRate)
+		if !ok {
+			fields["trader_commission_rate"] = []string{"The trader commission rate field must be a number."}
+		} else {
+			edit.TraderRate = text
+		}
+	}
+	if edit.ReserveSet && edit.Reserve < 0 {
+		fields["target_reserve_amount"] = []string{"The target reserve amount field must be at least 0."}
+	}
+	if len(fields) > 0 {
+		return NewUser{}, invalid(fields)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(edit.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return NewUser{}, err
 	}
@@ -93,7 +197,45 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 		return NewUser{}, err
 	}
 	now := s.now()
-	online := role == "Trader"
+	online := roleName == "Trader"
+	if edit.Banned != nil && *edit.Banned {
+		online = false
+	}
+	payouts := 0
+	if edit.Payouts != nil && *edit.Payouts {
+		payouts = 1
+	}
+	stop := 0
+	if edit.Stop != nil && *edit.Stop {
+		stop = 1
+	}
+	referral := "0.00"
+	if edit.ReferralSet && edit.Referral != "" {
+		referral = edit.Referral
+	}
+	reserve := 0
+	if roleName == "Trader" {
+		reserve = 1000
+	}
+	if edit.ReserveSet {
+		reserve = edit.Reserve
+	}
+	var category any
+	if edit.CategorySet && !edit.CategoryClear {
+		category = edit.CategoryID
+	}
+	var promo any
+	if edit.PromoSet && edit.Promo != "" {
+		promo = promoID
+	}
+	var rate any
+	if edit.TraderRateSet && !edit.TraderRateClear {
+		rate = edit.TraderRate
+	}
+	var bannedAt any
+	if edit.Banned != nil && *edit.Banned {
+		bannedAt = now
+	}
 	var created NewUser
 	err = s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
@@ -101,9 +243,11 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 				name, email, password, apk_access_token, api_access_token,
 				avatar_uuid, avatar_style, is_online, is_payout_online, is_vip,
 				referral_commission_percentage, payouts_enabled, stop_traffic,
+				trader_category_id, promo_code_id, trader_commission_rate, banned_at,
 				traffic_enabled_at, created_at, updated_at, additional_team_leader_ids
-			) VALUES (?, ?, ?, ?, ?, ?, 'adventurer', ?, 0, 0, 0, ?, 0, ?, ?, ?, '[]')`,
-			name, email, string(hash), apkToken, apiToken, email, online, payouts, now, now, now)
+			) VALUES (?, ?, ?, ?, ?, ?, 'adventurer', ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')`,
+			edit.Name, edit.Email, string(hash), apkToken, apiToken, edit.Email, boolBit(online),
+			referral, payouts, stop, category, promo, rate, bannedAt, now, now, now)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
 				return invalid(map[string][]string{"email": {"The email has already been taken."}})
@@ -114,7 +258,7 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 		if err != nil {
 			return err
 		}
-		if err := store.GrantRole(ctx, tx, id, roleID); err != nil {
+		if err := store.GrantRole(ctx, tx, id, edit.RoleID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
@@ -126,7 +270,12 @@ func (s *Service) CreateUser(ctx context.Context, actor int64, name, email, pass
 			id, reserve, now, now); err != nil {
 			return err
 		}
-		created = NewUser{ID: id, Email: email}
+		if edit.MerchantCategoriesSet {
+			if err := replaceMerchantCategories(ctx, tx, id, edit.MerchantCategories, now); err != nil {
+				return err
+			}
+		}
+		created = NewUser{ID: id, Email: edit.Email}
 		return nil
 	})
 	return created, err
@@ -255,6 +404,9 @@ func (s *Service) UpdateUser(ctx context.Context, actor, userID int64, edit User
 			edit.TraderRate = text
 		}
 	}
+	if edit.ReserveSet && edit.Reserve < 0 {
+		fields["target_reserve_amount"] = []string{"The target reserve amount field must be at least 0."}
+	}
 	if len(fields) > 0 {
 		return invalid(fields)
 	}
@@ -345,8 +497,24 @@ func (s *Service) UpdateUser(ctx context.Context, actor, userID int64, edit User
 			}
 		}
 		if edit.ReserveSet {
-			if _, err := tx.ExecContext(ctx, `UPDATE wallets SET target_reserve_amount = ?, updated_at = ? WHERE user_id = ?`, edit.Reserve, now, userID); err != nil {
+			res, err := tx.ExecContext(ctx, `UPDATE wallets SET target_reserve_amount = ?, updated_at = ? WHERE user_id = ?`, edit.Reserve, now, userID)
+			if err != nil {
 				return err
+			}
+			updated, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if updated == 0 {
+				if _, err := tx.ExecContext(ctx, `
+					INSERT INTO wallets (
+						user_id, merchant_balance, trust_balance, reserve_balance,
+						commission_balance, teamleader_balance, currency, target_reserve_amount,
+						created_at, updated_at
+					) VALUES (?, '0', '0', '0', '0', '0', 'usdt', ?, ?, ?)`,
+					userID, edit.Reserve, now, now); err != nil {
+					return err
+				}
 			}
 		}
 		if edit.MerchantCategoriesSet {
@@ -460,8 +628,8 @@ func percentText(raw string) (string, bool) {
 	return strconv.FormatFloat(value, 'f', 2, 64), true
 }
 
-// Deposit credits a USDT balance. Trust fills the reserve target first.
-func (s *Service) Deposit(ctx context.Context, actor, userID int64, amount, balanceType string) error {
+// Deposit credits a USDT balance and stores a successful invoice. Trust fills the reserve target first.
+func (s *Service) Deposit(ctx context.Context, actor, userID int64, amount, balanceType, txHash string) error {
 	if err := s.requireRole(ctx, actor, "Admin"); err != nil {
 		return err
 	}
@@ -469,16 +637,62 @@ func (s *Service) Deposit(ctx context.Context, actor, userID int64, amount, bala
 	if err != nil {
 		return invalid(map[string][]string{"amount": {"The amount field must be a number."}})
 	}
+	floor, err := money.Zero("usdt")
+	if err != nil {
+		return err
+	}
+	nonPositive, err := value.LessOrEqual(floor)
+	if err != nil || nonPositive {
+		return invalid(map[string][]string{"amount": {"The amount must be greater than 0."}})
+	}
+	hash := strings.TrimSpace(txHash)
+	if len(hash) > 255 {
+		return invalid(map[string][]string{"tx_hash": {"The tx hash must not be greater than 255 characters."}})
+	}
+	requested := strings.TrimSpace(balanceType)
 	now := s.now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		switch balanceType {
-		case "trust":
-			return creditTrust(ctx, tx, userID, value.Units(), now)
-		case "merchant":
-			return creditMerchant(ctx, tx, userID, value.Units(), "deposit_by_admin", now)
-		default:
-			return invalid(map[string][]string{"balance_type": {"The selected balance type is invalid."}})
+		var roleName string
+		err := tx.QueryRowContext(ctx, `
+			SELECT r.name
+			FROM user_roles ur
+			INNER JOIN roles r ON r.id = ur.role_id
+			WHERE ur.user_id = ? AND r.name IN ('Trader', 'Merchant', 'Team Leader')
+			LIMIT 1`, userID).Scan(&roleName)
+		if err == sql.ErrNoRows {
+			return invalid(map[string][]string{"balance_type": {"У этой роли нет баланса для пополнения."}})
 		}
+		if err != nil {
+			return err
+		}
+		kind, ok := roleBalance(roleName)
+		if !ok {
+			return invalid(map[string][]string{"balance_type": {"У этой роли нет баланса для пополнения."}})
+		}
+		if requested != "" && requested != kind {
+			return invalid(map[string][]string{"balance_type": {"Баланс не соответствует роли пользователя."}})
+		}
+		switch kind {
+		case "trust":
+			err = creditTrust(ctx, tx, userID, value.Units(), now)
+		case "merchant":
+			err = creditMerchant(ctx, tx, userID, value.Units(), "deposit_by_admin", now)
+		default:
+			err = creditTeamleader(ctx, tx, userID, value.Units(), now)
+		}
+		if err != nil {
+			return err
+		}
+		row, err := lockWallet(ctx, tx, userID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO invoices (
+				amount, currency, type, balance_type, status, tx_hash, wallet_id, created_at, updated_at
+			) VALUES (?, 'usdt', 'deposit', ?, 'success', ?, ?, ?, ?)`,
+			value.Units(), kind, emptyAsNil(hash), row.ID, now, now)
+		return err
 	})
 }
 
@@ -525,6 +739,19 @@ func (s *Service) SetMarketPrice(ctx context.Context, actor int64, currency, mar
 		SellUnits: sellMoney.Units(),
 		HoldUntil: s.now().Add(market.ManualHold),
 	})
+}
+
+func roleBalance(role string) (string, bool) {
+	switch role {
+	case "Trader":
+		return "trust", true
+	case "Merchant":
+		return "merchant", true
+	case "Team Leader":
+		return "teamleader", true
+	default:
+		return "", false
+	}
 }
 
 func (s *Service) requireRole(ctx context.Context, userID int64, role string) error {

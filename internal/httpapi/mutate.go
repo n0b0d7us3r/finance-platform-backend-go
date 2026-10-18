@@ -25,6 +25,10 @@ func (h *handler) mutateRoutes(router chi.Router) {
 	router.Post("/api/frontend/trader/impersonate/leave", h.leaveImpersonate)
 	router.Post("/api/frontend/support/impersonate/leave", h.leaveImpersonate)
 	router.Post("/api/frontend/leader/impersonate/leave", h.leaveImpersonate)
+	router.Post("/api/frontend/merchant/wallet/deposit", h.viewedDeposit)
+	router.Post("/api/frontend/trader/wallet/deposit", h.viewedDeposit)
+	router.Post("/api/frontend/support/wallet/deposit", h.viewedDeposit)
+	router.Post("/api/frontend/leader/wallet/deposit", h.viewedDeposit)
 
 	router.Patch("/api/frontend/admin/password", h.changePassword("Admin"))
 	router.Patch("/api/frontend/merchant/password", h.changePassword("Merchant"))
