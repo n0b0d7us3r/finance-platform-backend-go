@@ -344,20 +344,20 @@ func (h *handler) deposit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) viewedDeposit(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.user(w, r); !ok {
+	userID, ok := h.user(w, r)
+	if !ok {
 		return
 	}
-	active, viewing := impersonate.FromContext(r.Context())
-	if !viewing {
-		writeMessage(w, http.StatusForbidden, "Пополнение доступно администратору в режиме просмотра.")
-		return
+	actor, target := userID, userID
+	if active, viewing := impersonate.FromContext(r.Context()); viewing {
+		actor, target = active.ActorID, active.TargetID
 	}
 	var body depositBody
 	if err := decode(r, &body); err != nil {
 		writeFail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if h.writeFlow(w, h.flow().Deposit(r.Context(), active.ActorID, active.TargetID, body.Amount.String(), body.BalanceType, body.TxHash)) {
+	if h.writeFlow(w, h.flow().Deposit(r.Context(), actor, target, body.Amount.String(), body.BalanceType, body.TxHash)) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Средства зачислены"})

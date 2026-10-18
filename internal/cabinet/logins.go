@@ -3,6 +3,9 @@ package cabinet
 import (
 	"context"
 	"database/sql"
+	"strconv"
+
+	"finance-platform/go/internal/auditlog"
 )
 
 // UserLogins is the admin list of cabinet sign-ins.
@@ -39,4 +42,41 @@ func (r *Reader) UserLogins(ctx context.Context, page Page) (map[string]any, err
 		})
 	}
 	return Block(page, total, items), rows.Err()
+}
+
+// SecurityActions is the admin history of bulk traffic controls.
+func (r *Reader) SecurityActions(ctx context.Context, limit int) ([]auditlog.Entry, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.DB.QueryContext(ctx, `
+		SELECT s.id, s.user_id, COALESCE(u.name, ''), COALESCE(u.email, ''), s.action, s.label, s.created_at
+		FROM security_actions s
+		LEFT JOIN users u ON u.id = s.user_id
+		ORDER BY s.id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []auditlog.Entry{}
+	for rows.Next() {
+		var id, userID int64
+		var name, email, action, label string
+		var created sql.NullTime
+		if err := rows.Scan(&id, &userID, &name, &email, &action, &label, &created); err != nil {
+			return nil, err
+		}
+		when, _ := r.when(created).(string)
+		items = append(items, auditlog.Entry{
+			ID:        strconv.FormatInt(id, 10),
+			UserID:    userID,
+			UserName:  name,
+			UserEmail: email,
+			Action:    action,
+			Label:     label,
+			CreatedAt: when,
+		})
+	}
+	return items, rows.Err()
 }

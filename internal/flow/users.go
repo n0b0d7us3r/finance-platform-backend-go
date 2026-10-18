@@ -630,8 +630,10 @@ func percentText(raw string) (string, bool) {
 
 // Deposit credits a USDT balance and stores a successful invoice. Trust fills the reserve target first.
 func (s *Service) Deposit(ctx context.Context, actor, userID int64, amount, balanceType, txHash string) error {
-	if err := s.requireRole(ctx, actor, "Admin"); err != nil {
-		return err
+	if actor != userID {
+		if err := s.requireRole(ctx, actor, "Admin"); err != nil {
+			return err
+		}
 	}
 	value, err := money.FromPrecision(amount, "usdt")
 	if err != nil {

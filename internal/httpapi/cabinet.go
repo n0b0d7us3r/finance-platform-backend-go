@@ -645,13 +645,13 @@ func (h *handler) adminSecurityHistory(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.actor(w, r, "Admin"); !ok {
 		return
 	}
-	rows := []auditlog.Entry{}
-	var err error
-	if h.deps.Audit != nil {
+	reader := &cabinet.Reader{DB: h.deps.DB.SQL, Location: h.deps.Location}
+	rows, err := reader.SecurityActions(r.Context(), 50)
+	if err != nil && h.deps.Audit != nil {
 		rows, err = h.deps.Audit.Recent(r.Context(), 50)
-		if rows == nil {
-			rows = []auditlog.Entry{}
-		}
+	}
+	if rows == nil {
+		rows = []auditlog.Entry{}
 	}
 	h.showCabinet(w, map[string]any{"actions": rows}, err)
 }
@@ -667,6 +667,11 @@ func (h *handler) recordSecurityAction(ctx context.Context, actor int64, action 
 	at := time.Now()
 	if h.deps.Location != nil {
 		at = at.In(h.deps.Location)
+	}
+	if h.deps.DB.SQL != nil {
+		_, _ = h.deps.DB.SQL.ExecContext(ctx, `
+			INSERT INTO security_actions (user_id, action, label, created_at) VALUES (?, ?, ?, ?)`,
+			actor, action, securityLabel(action), at)
 	}
 	_ = h.deps.Audit.Append(ctx, auditlog.Entry{
 		ID:        strconv.FormatInt(at.UnixNano(), 10),
